@@ -1,0 +1,266 @@
+# =============================================================================
+# Fleet Dashboard - Fleet Monitoring & Management
+# =============================================================================
+# Port Allocation: App 3008, PostgreSQL 5441, Redis 6388
+# Network: 172.30.72.0/24
+# =============================================================================
+
+services:
+  fleet-app:
+    container_name: fleet-app
+    build: .
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=100m
+      - /app/.next/cache:size=200m
+    ports:
+      - "127.0.0.1:3008:3000"
+    environment:
+      - NODE_ENV=production
+      - HOSTNAME=0.0.0.0
+      # Database - least-privilege app user (init-app-user.sh creates fleet_app on first run)
+      # NOTE: Existing volumes need: docker exec fleet-postgres psql -U fleet -c "CREATE ROLE fleet_app WITH LOGIN PASSWORD 'newpass'; GRANT CONNECT ON DATABASE fleet_db TO fleet_app; GRANT USAGE ON SCHEMA public TO fleet_app; GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO fleet_app; GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO fleet_app;"
+      - DATABASE_URL=postgresql://fleet_app:${FLEET_APP_PASSWORD:?FLEET_APP_PASSWORD required in .env}@fleet-postgres:5432/fleet_db
+      - REDIS_URL=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD required in .env}@fleet-redis:6379
+      - AUTH_SECRET=${AUTH_SECRET:?AUTH_SECRET required in .env}
+      - NEXTAUTH_SECRET=${AUTH_SECRET}
+      - NEXTAUTH_URL=http://localhost:3008
+      - AUTH_TRUST_HOST=true
+      - FLEET_AGENT_URL=http://fleet-agent:5050
+      - FLEET_AGENT_SECRET=${FLEET_AGENT_SECRET:?FLEET_AGENT_SECRET required in .env}
+      # read-only root FS: gunicorn writes its control socket under $HOME, so point it at the tmpfs
+      - HOME=/tmp
+      # Encryption key for Telegram bot token at rest (generate: openssl rand -hex 32)
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:?ENCRYPTION_KEY required in .env}
+      # Shared with fleet-cron: POST /api/metrics/collect (metrics history + alerts)
+      - CRON_SECRET=${CRON_SECRET:?CRON_SECRET required in .env}
+    depends_on:
+      fleet-postgres:
+        condition: service_healthy
+      fleet-redis:
+        condition: service_healthy
+      fleet-agent:
+        condition: service_healthy
+    networks:
+      - fleet-network
+    restart: "no"
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "-O",
+          "/dev/null",
+          "http://127.0.0.1:3000/api/health",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1"
+          pids: 200
+        reservations:
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+
+  # SECURITY EXCEPTION: Docker socket mount (read-only)
+  # Required for fleet monitoring — agent enumerates containers, reads stats/logs.
+  # Mitigations: read-only mount, no-new-privileges, cap_drop ALL, isolated network,
+  # agent API protected by FLEET_AGENT_SECRET, no external port exposure.
+  # Accepted risk per security audit 2026-02-09.
+  fleet-agent:
+    container_name: fleet-agent
+    build: ./fleet-agent
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=50m
+    # Docker socket owned by root:root (gid=0) — add group for socket access
+    group_add:
+      - "0"
+    environment:
+      - FLEET_AGENT_SECRET=${FLEET_AGENT_SECRET:?FLEET_AGENT_SECRET required in .env}
+      # read-only root FS: gunicorn writes its control socket under $HOME, so point it at the tmpfs
+      - HOME=/tmp
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - fleet-network
+    restart: "no"
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5050/health')",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+          pids: 200
+        reservations:
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+
+  fleet-postgres:
+    container_name: fleet-postgres
+    image: postgres:16.15-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685 # bare -alpine suffix; -alpine3.21 yanked from Hub 2026-05-14
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - FOWNER
+      - DAC_OVERRIDE
+    environment:
+      - POSTGRES_USER=fleet
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required in .env}
+      - POSTGRES_DB=fleet_db
+      - FLEET_APP_PASSWORD=${FLEET_APP_PASSWORD:?FLEET_APP_PASSWORD required in .env}
+    volumes:
+      - fleet_postgres:/var/lib/postgresql/data
+      - ./postgres/init-app-user.sh:/docker-entrypoint-initdb.d/02-init-app-user.sh:ro
+    ports:
+      - "127.0.0.1:5441:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U fleet -d fleet_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - fleet-network
+    restart: "no"
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+          pids: 200
+        reservations:
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+        compress: "true"
+
+  fleet-redis:
+    container_name: fleet-redis
+    image: redis:8.10.0-alpine@sha256:978f0e01593e65eed801f2402944efcd936d43b5027e4908a7897baf88ed6241
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD required in .env}
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD required in .env}
+    ports:
+      - "127.0.0.1:6388:6379"
+    volumes:
+      - fleet_redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - fleet-network
+    restart: "no"
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+          pids: 200
+        reservations:
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+        compress: "true"
+
+  # Collects metrics every 5 minutes (history for /metrics, and the Telegram alerts)
+  fleet-cron:
+    container_name: fleet-cron
+    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+    command:
+      - sh
+      - -c
+      - 'sleep 60; while true; do wget -q -O /dev/null --post-data "" --header "x-cron-secret: $$CRON_SECRET" http://fleet-app:3000/api/metrics/collect || echo "metrics collect failed"; sleep 300; done'
+    environment:
+      - CRON_SECRET=${CRON_SECRET:?CRON_SECRET required in .env}
+    depends_on:
+      fleet-app:
+        condition: service_healthy
+    user: "65534:65534"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - fleet-network
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          memory: 32M
+          cpus: "0.1"
+          pids: 20
+
+volumes:
+  fleet_postgres:
+  fleet_redis:
+
+networks:
+  fleet-network:
+    name: fleet-network
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.72.0/24
